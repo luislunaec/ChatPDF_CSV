@@ -3,307 +3,301 @@ import os
 import hashlib
 import chromadb
 import google.generativeai as genai
+import pandas as pd
+import io
 
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 
 # ============================================================
-# CONFIGURACIÓN GENERAL
+# 1. CONFIGURACIÓN GENERAL
 # ============================================================
-st.set_page_config(page_title="Chat PDF con Gemini")
+st.set_page_config(page_title="Super Data Assistant", layout="wide")
 
-# Carga variables de entorno desde .env
-# Aquí se espera GOOGLE_API_KEY=xxxx
+# Carga variables de entorno
 load_dotenv()
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
-# Modelo de embeddings local
-# Se puede cambiar por otros modelos de sentence-transformers
+# Modelo de embeddings (solo se usa para PDF)
 EMBEDDING_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
 
-# Se Inicializa el Cliente de ChromaDB
+# Inicializa ChromaDB
 client = chromadb.Client()
 
 # ============================================================
-# SESSION STATE
+# 2. SESSION STATE (Memoria de la app)
 # ============================================================
-# session_state nos permite "recordar" cosas entre reruns.
 if "collection" not in st.session_state:
     st.session_state.collection = None
-
 if "pdf_processed" not in st.session_state:
     st.session_state.pdf_processed = False
-
-if "pdf_hash" not in st.session_state:
-    st.session_state.pdf_hash = None
+if "file_hash" not in st.session_state:
+    st.session_state.file_hash = None
 
 # ============================================================
-# FUNCIONES
+# 3. FUNCIONES PARA DATOS (CSV / EXCEL) 📊
 # ============================================================
-def hash_pdf(file) -> str:
-    return hashlib.sha256(file.getvalue()).hexdigest()
-
-def extract_text_from_pdf(pdf_file):
-    """
-    Extrae texto de un PDF digital (no escaneado).
-    Incluye el número de página como marcador.
-    """
-    reader = PdfReader(pdf_file)
-    text = ""
-
-    for i, page in enumerate(reader.pages):
-        content = page.extract_text()
-        if content:
-            text += f"\n[Página {i+1}]\n{content}"
-
-    return text
-
-
-def chunk_text(text):
-    """
-    Divide un texto largo en fragmentos (chunks) con solapamiento.
-
-    chunk_size:
-        - Número máximo de caracteres por fragmento
-        - Valores típicos: 400–800
-        - Más grande = más contexto, pero embeddings más caros
-
-    overlap:
-        - Número de caracteres que se repiten entre chunks consecutivos
-        - Evita que una idea quede cortada entre fragmentos
-        - Regla común: 10–20% del chunk_size
-
-    Devuelve:
-        Lista de diccionarios, cada uno representando un chunk con:
-        - id           -> identificador único
-        - content      -> texto del fragmento
-        - start_index  -> posición donde comienza en el texto original
-        - size         -> longitud real del chunk
-    """
-    chunk_size = 500 
-    overlap = 100
-    chunks = []          # Aquí guardaremos todos los fragmentos
-    start = 0            # Puntero que indica desde dónde empezamos a cortar
-    chunk_id = 0         # Contador para asignar IDs únicos
-
-    # El while se ejecuta mientras NO hayamos llegado al final del texto
-    while start < len(text):
-
-        # 1️⃣ Cortamos el texto desde 'start' hasta 'start + chunk_size'
-        #    Python corta automáticamente si se pasa del largo del texto
-        chunk_text = text[start:start + chunk_size]
-
-        # 2️⃣ Guardamos el chunk junto con metadata útil
-        chunks.append({
-            "id": f"chunk_{chunk_id}",   # Identificador único del fragmento
-            "content": chunk_text,       # Texto real del fragmento
-            "start_index": start,        # Posición en el texto original
-            "size": len(chunk_text)      # Tamaño real del fragmento
-        })
-
-        # 3️⃣ Incrementamos el ID para el próximo chunk
-        chunk_id += 1
-
-        # 4️⃣ Avanzamos el puntero 'start'
-        #    No avanzamos chunk_size completo,
-        #    sino (chunk_size - overlap) para que haya solapamiento
-        #
-        #    Ejemplo:
-        #    chunk_size = 500
-        #    overlap    = 100
-        #    start avanza 400 caracteres
-        #
-        #    Los últimos 100 caracteres del chunk actual
-        #    aparecerán también al inicio del siguiente
-        start += chunk_size - overlap
-
-    # 5️⃣ Cuando start >= len(text), el while termina
-    #    y devolvemos todos los fragmentos creados
-    return chunks
-
-
-
-def create_chroma_collection(chunks):
-    """
-    Crea una colección nueva en ChromaDB a partir de los chunks generados.
-
-    Cada chunk se almacena junto con:
-    - su embedding (vector numérico)
-    - su texto original
-    - metadata útil
-    """
-
-    # ------------------------------
-    # 1️⃣ Borrado defensivo
-    # ------------------------------
-    # Si ya existe una colección con el mismo nombre ("pdf_rag"),
+def load_data(file, separator):
+    """Carga CSV usando el separador elegido o Excel automáticamente"""
+    filename = file.name.lower()
+    
     try:
-        client.delete_collection("pdf_rag")
-    except:
-        # Si la colección no existe, Chroma lanza error.
-        # Lo ignoramos porque es un caso esperado.
-        pass
+        if filename.endswith('.csv'):
+            # seek(0) es vital para asegurar que leemos desde el principio
+            file.seek(0)
+            return pd.read_csv(file, sep=separator)
+            
+        elif filename.endswith('.xlsx') or filename.endswith('.xls'):
+            return pd.read_excel(file)
+            
+    except Exception as e:
+        st.error(f"Error cargando archivo: {e}")
+        return None
 
-    # ------------------------------
-    # 2️⃣ Crear colección nueva
-    # ------------------------------
-    # Aquí Chroma crea:
-    # - una tabla de documentos
-    # - un índice vectorial
-    # - espacio para metadatos
-    collection = client.create_collection(name="pdf_rag")
+def analyze_outliers(df):
+    """Detecta outliers usando el método IQR (Rango Intercuartil)"""
+    numeric_cols = df.select_dtypes(include=['number'])
+    outlier_summary = {}
+    
+    for col in numeric_cols.columns:
+        series = df[col].dropna()
+        if len(series) > 0:
+            Q1 = series.quantile(0.25)
+            Q3 = series.quantile(0.75)
+            IQR = Q3 - Q1
+            lower_bound = Q1 - 1.5 * IQR
+            upper_bound = Q3 + 1.5 * IQR
+            
+            outliers = series[(series < lower_bound) | (series > upper_bound)]
+            if len(outliers) > 0:
+                outlier_summary[col] = len(outliers)
+            
+    return outlier_summary
 
-    # ------------------------------
-    # 3️⃣ Separar texto de metadata
-    # ------------------------------
-    # Extraemos SOLO el contenido textual de cada chunk.
-    # Esto es lo que se convertirá en embeddings.
-    texts = [c["content"] for c in chunks]
-
-    # ------------------------------
-    # 4️⃣ Generar embeddings
-    # ------------------------------
-    # El modelo de SentenceTransformers convierte cada texto
-    # en un vector numérico.
-    #
-    # Cada vector representa el significado del chunk.
-    embeddings = EMBEDDING_MODEL.encode(texts)
-
-    # ------------------------------
-    # 5️⃣ Insertar datos en Chroma
-    # ------------------------------
-    collection.add(
-        # Texto original del chunk
-        documents=texts,
-
-        # Vectores que permiten búsqueda semántica
-        embeddings=embeddings.tolist(),
-
-        # IDs únicos
-        # Sirven para identificar cada chunk internamente
-        ids=[c["id"] for c in chunks],
-
-        # Metadata asociada a cada chunk
-        metadatas=[
-            {
-                "chunk_index": i,         # Orden del chunk
-                "start_index": c["start_index"],  # Posición en el texto original
-                "chunk_size": c["size"]   # Tamaño real del fragmento
-            }
-            for i, c in enumerate(chunks)
-        ]
-    )
-
-    # ------------------------------
-    # 6️⃣ Devolver colección lista
-    # ------------------------------
-    # La colección ya puede:
-    # - recibir queries (preguntas)
-    # - devolver chunks relevantes
-    return collection
-
-
-
-def retrieve_context(collection, query, k=4):
-    """
-    Recupera los k chunks más similares a la pregunta.
-    Devuelve tanto el texto como la metadata asociada.
-    """
-    query_embedding = EMBEDDING_MODEL.encode([query])
-
-    results = collection.query(
-        query_embeddings=query_embedding.tolist(),
-        n_results=k
-    )
-
-    return results
-
-
-def ask_gemini(context, question):
-    """
-    Llama a Gemini usando el contexto recuperado.
-    El prompt fuerza comportamiento RAG (no inventar).
-    """
+def get_gemini_data_insight(df_info_str, stats_str, outliers_str):
+    """Pide a Gemini que interprete los datos estadísticos"""
     model = genai.GenerativeModel("models/gemini-2.5-flash-lite")
-
     prompt = f"""
-Eres un asistente que responde SOLO con la información del contexto.
-Si la respuesta no está en el contexto, di: "No se encuentra en el documento".
+    Actúa como un Científico de Datos Senior realizando una auditoría.
+    Analiza estas métricas del dataset cargado:
 
-Contexto:
-{context}
+    1. ESTRUCTURA DEL DATASET:
+    {df_info_str}
 
-Pregunta:
-{question}
-"""
+    2. ESTADÍSTICAS DESCRIPTIVAS:
+    {stats_str}
+    
+    3. OUTLIERS (Valores Atípicos):
+    {outliers_str}
 
+    TU MISIÓN:
+    - Escribe un resumen ejecutivo sobre la calidad de los datos.
+    - Menciona si hay problemas graves (muchos nulos, outliers sospechosos).
+    - Sugiere 2 pasos de limpieza recomendados.
+    - Usa formato Markdown limpio y profesional.
+    """
     response = model.generate_content(prompt)
     return response.text
 
 # ============================================================
-# INTERFAZ
+# 4. FUNCIONES PARA PDF (RAG + CHAT) 📄
+# ============================================================
+def hash_file(file) -> str:
+    return hashlib.sha256(file.getvalue()).hexdigest()
+
+def extract_text_from_pdf(pdf_file):
+    reader = PdfReader(pdf_file)
+    text = ""
+    for i, page in enumerate(reader.pages):
+        content = page.extract_text()
+        if content:
+            text += f"\n[Página {i+1}]\n{content}"
+    return text
+
+def chunk_text(text, chunk_size=500, overlap=100):
+    chunks = []
+    start = 0
+    chunk_id = 0
+    while start < len(text):
+        chunk_text = text[start:start + chunk_size]
+        chunks.append({
+            "id": f"chunk_{chunk_id}",
+            "content": chunk_text,
+            "start_index": start,
+            "size": len(chunk_text)
+        })
+        chunk_id += 1
+        start += chunk_size - overlap
+    return chunks
+
+def create_chroma_collection(chunks):
+    try:
+        client.delete_collection("pdf_rag")
+    except:
+        pass
+    collection = client.create_collection(name="pdf_rag")
+    texts = [c["content"] for c in chunks]
+    embeddings = EMBEDDING_MODEL.encode(texts)
+    collection.add(
+        documents=texts,
+        embeddings=embeddings.tolist(),
+        ids=[c["id"] for c in chunks],
+        metadatas=[{"chunk_index": i, "start_index": c["start_index"], "chunk_size": c["size"]} for i, c in enumerate(chunks)]
+    )
+    return collection
+
+def retrieve_context(collection, query, k=4):
+    query_embedding = EMBEDDING_MODEL.encode([query])
+    results = collection.query(query_embeddings=query_embedding.tolist(), n_results=k)
+    return results
+
+# ============================================================
+# 5. INTERFAZ GRÁFICA (FRONTEND)
 # ============================================================
 
-st.title("📄 Chat con PDF + ChromaDB + Gemini")
+st.title("🤖 Asistente de Datos Pro (PDF + Excel + CSV)")
+st.markdown("Sube un archivo para comenzar: **PDF** (Chat) o **Excel/CSV** (Auditoría Automática).")
 
-uploaded_pdf = st.file_uploader("Sube un PDF", type="pdf")
+uploaded_file = st.file_uploader("Cargar archivo aquí", type=["pdf", "csv", "xlsx"])
 
-# 🔄 Detectar cambio de PDF y resetear estado
-if uploaded_pdf:
-    current_hash = hash_pdf(uploaded_pdf)
-
-    if st.session_state.pdf_hash != current_hash:
-        st.session_state.pdf_hash = current_hash
+if uploaded_file:
+    # Detectar extensión
+    file_ext = uploaded_file.name.split('.')[-1].lower()
+    
+    # Resetear estado si cambia el archivo
+    current_hash = hash_file(uploaded_file)
+    if st.session_state.file_hash != current_hash:
+        st.session_state.file_hash = current_hash
         st.session_state.pdf_processed = False
         st.session_state.collection = None
 
-# ------------------------------
-# BOTÓN PROCESAR PDF
-# ------------------------------
-if uploaded_pdf and not st.session_state.pdf_processed:
-    if st.button("📥 Procesar PDF"):
-        with st.spinner("Procesando PDF..."):
-            text = extract_text_from_pdf(uploaded_pdf)
-            chunks = chunk_text(text)
-            st.session_state.collection = create_chroma_collection(chunks)
-            st.session_state.pdf_processed = True
+    # =======================================================
+    # 🅰️ MODO ANALISTA: CSV O EXCEL
+    # =======================================================
+    if file_ext in ['csv', 'xlsx']:
+        
+        # --- CONFIGURACIÓN DE SEPARADOR (Solo CSV) ---
+        sep = ',' # Default
+        if file_ext == 'csv':
+            col_sep, col_info = st.columns([1, 3])
+            with col_sep:
+                option = st.selectbox(
+                    "🛠️ Separador de columnas:",
+                    ("Coma (,)", "Punto y coma (;)", "Tabulación (Tab)", "Barra (|)"),
+                    index=0
+                )
+                if "Coma" in option: sep = ','
+                elif "Punto y coma" in option: sep = ';'
+                elif "Tab" in option: sep = '\t'
+                elif "Barra" in option: sep = '|'
+        
+        # --- CARGA DE DATOS ---
+        df = load_data(uploaded_file, sep)
+        
+        if df is not None:
+            # Validación rápida de carga
+            st.success(f"✅ Archivo cargado correctamente: {df.shape[0]} filas, {df.shape[1]} columnas.")
+            
+            # Advertencia si se ve mal (1 sola columna suele ser error de separador)
+            if df.shape[1] == 1 and file_ext == 'csv':
+                st.warning("⚠️ ¡Atención! Se detectó solo 1 columna. ¿Quizás el separador es incorrecto? Intenta cambiarlo arriba.")
 
-        st.success(f"PDF procesado ✅ ({len(chunks)} fragmentos)")
+            # --- VISTA PREVIA ---
+            with st.expander("👀 Ver Datos (Primeras 5 filas)", expanded=True):
+                st.dataframe(df.head())
 
-# ------------------------------
-# SECCIÓN DE PREGUNTAS
-# ------------------------------
-if st.session_state.pdf_processed and st.session_state.collection:
-    st.divider()
-    st.subheader("❓ Pregunta al documento")
+            st.divider()
 
-    question = st.text_input("Escribe tu pregunta")
+            # --- DASHBOARD DE SALUD ---
+            st.subheader("1. 🏥 Salud de los Datos")
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Filas Totales", df.shape[0])
+            col2.metric("Variables", df.shape[1])
+            col3.metric("Filas Duplicadas", df.duplicated().sum())
+            total_nulos = df.isnull().sum().sum()
+            col4.metric("Datos Faltantes (Nulos)", total_nulos)
 
-    if st.button("🤖 Preguntar") and question:
-        with st.spinner("Buscando respuesta..."):
-            results = retrieve_context(st.session_state.collection, question)
+            if total_nulos > 0:
+                st.caption("Gráfica de nulos por columna:")
+                st.bar_chart(df.isnull().sum())
 
-            # Unimos los documentos para Gemini
-            context_text = "\n\n".join(results["documents"][0])
+            # --- ESTADÍSTICAS AVANZADAS ---
+            st.subheader("2. 📈 Perfilamiento Estadístico")
+            tab1, tab2 = st.tabs(["Estadística Descriptiva", "Detectar Outliers"])
+            
+            with tab1:
+                st.dataframe(df.describe().T) # Transpuesta para leer mejor
+            
+            with tab2:
+                outliers = analyze_outliers(df)
+                if outliers:
+                    st.error(f"🚨 Se detectaron valores atípicos en {len(outliers)} columnas.")
+                    st.write("Conteo de valores fuera del rango normal (Método IQR):")
+                    st.json(outliers)
+                else:
+                    st.success("✅ No se detectaron outliers estadísticos evidentes.")
 
-            answer = ask_gemini(context_text, question)
+            # --- GEMINI INSIGHTS ---
+            st.divider()
+            st.subheader("3. 🧠 Diagnóstico Inteligente (IA)")
+            st.markdown("Deja que Gemini analice los números y te dé una opinión experta.")
+            
+            if st.button("✨ Generar Reporte con Gemini"):
+                with st.spinner("Analizando patrones en los datos..."):
+                    # Preparamos la info técnica para enviarla al prompt
+                    buffer = io.StringIO()
+                    df.info(buf=buffer)
+                    info_str = buffer.getvalue()
+                    
+                    insight = get_gemini_data_insight(
+                        df_info_str=info_str,
+                        stats_str=df.describe().to_string(),
+                        outliers_str=str(outliers)
+                    )
+                    st.markdown(insight)
 
-        st.subheader("🤖 Respuesta")
-        st.write(answer)
+    # =======================================================
+    # 🅱️ MODO CHAT: PDF
+    # =======================================================
+    elif file_ext == 'pdf':
+        st.info("📂 Archivo PDF detectado. Modo Chat RAG activado.")
+        
+        # Botón para procesar (Indexar)
+        if not st.session_state.pdf_processed:
+            if st.button("📥 Procesar Documento"):
+                with st.spinner("Leyendo y vectorizando el PDF..."):
+                    text = extract_text_from_pdf(uploaded_file)
+                    chunks = chunk_text(text)
+                    st.session_state.collection = create_chroma_collection(chunks)
+                    st.session_state.pdf_processed = True
+                st.success("¡Documento listo! Ya puedes chatear con él.")
 
-        # ------------------------------
-        # DETALLE DEL CONTEXTO USADO
-        # ------------------------------
-        with st.expander("📚 Contexto usado (detallado)"):
-            for i, (doc, meta) in enumerate(
-                zip(results["documents"][0], results["metadatas"][0])
-            ):
-                st.markdown(f"""
-**Chunk #{meta['chunk_index']}**
-- 📍 Inicio en texto: `{meta['start_index']}`
-- 📏 Tamaño: `{meta['chunk_size']}` caracteres
+        # Área de Chat
+        if st.session_state.pdf_processed:
+            question = st.chat_input("Pregunta algo sobre el documento...")
+            
+            if question:
+                # 1. Mostrar pregunta usuario
+                with st.chat_message("user"):
+                    st.write(question)
 
-```text
-{doc}
-""")
+                # 2. Generar respuesta
+                with st.spinner("Buscando en el documento..."):
+                    results = retrieve_context(st.session_state.collection, question)
+                    context_text = "\n\n".join(results["documents"][0])
+                    
+                    # Llamada a Gemini
+                    model = genai.GenerativeModel("models/gemini-2.5-flash-lite")
+                    prompt_rag = f"""
+                    Responde a la pregunta basándote ÚNICAMENTE en el siguiente contexto extraído del PDF.
+                    Si la respuesta no está en el texto, indícalo claramente.
+                    
+                    CONTEXTO:
+                    {context_text}
+                    
+                    PREGUNTA: {question}
+                    """
+                    response = model.generate_content(prompt_rag)
+                
+                
